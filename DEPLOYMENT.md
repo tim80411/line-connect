@@ -22,7 +22,7 @@ LINE OA ──webhook──> line-connect.zhiri.app (Cloudflare proxied)
 
 ## 正規發版流程（唯一正道）
 
-發 GitHub Release 就是部署。不要手動 docker push、不要手動改 cluster。
+**推 `vX.Y.Z` tag 就是部署**。不要手動 docker push、不要手動改 cluster。
 
 ```bash
 # 1. 確定 main 是綠的（CI: test job）且工作樹乾淨
@@ -31,16 +31,19 @@ git status --short          # 應為空
 gh run list --limit 1       # 最新 run 應 success
 
 # 2. 版本號：pyproject.toml 的 version 與 tag 一致（去掉 v 前綴）
-#    先改 pyproject.toml [project] version = "X.Y.Z"，commit + push
+#    先改 pyproject.toml [project] version 與 src/line_connect/__init__.py
+#    的 __version__，commit + push
 
-# 3. 發 release（這一步觸發部署）
-gh release create vX.Y.Z --generate-notes
+# 3. 推 tag（這一步觸發部署）
+git tag vX.Y.Z && git push origin vX.Y.Z
+#    （`gh release create vX.Y.Z --generate-notes` 也會建同名 tag，同樣觸發，
+#      想留 release notes 時用這個。）
 ```
 
 自動化鏈路（`.github/workflows/docker.yml`）：
 
 ```
-release published
+push tag vX.Y.Z
   → test job（ruff + mypy + pytest，紅了就全停）
   → build job（QEMU arm64 → push ghcr.io/tim80411/line-connect:X.Y.Z）
   → deploy job（用 K8S_APPS_DEPLOY_KEY 把 k8s-apps 的

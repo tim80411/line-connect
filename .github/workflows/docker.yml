@@ -3,8 +3,7 @@ name: CI / Release deploy
 on:
   push:
     branches: [main]
-  release:
-    types: [published]
+    tags: ["v*"]
 
 jobs:
   test:
@@ -38,12 +37,12 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
-          # Releases (vX.Y.Z tag) produce the immutable X.Y.Z tag that the
+          # A vX.Y.Z tag produces the immutable X.Y.Z image tag that the
           # deploy job pins in k8s-apps. Plain main pushes only produce
           # main-<sha> for ad-hoc testing — they never deploy.
           tags: |
             type=semver,pattern={{version}}
-            type=sha,prefix=main-,enable=${{ github.event_name == 'push' }}
+            type=sha,prefix=main-,enable=${{ github.ref == 'refs/heads/main' }}
       # Cluster is OCI Ampere (aarch64); build arm64 only via QEMU.
       - uses: docker/build-push-action@v6
         with:
@@ -56,9 +55,10 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    # Publishing a GitHub Release is the deploy trigger: bump the image tag in
-    # k8s-apps and let ArgoCD roll it out.
-    if: github.event_name == 'release'
+    # Pushing a vX.Y.Z tag is the deploy trigger: bump the image tag in
+    # k8s-apps and let ArgoCD roll it out. (Creating a GitHub Release also
+    # creates the tag, so `gh release create vX.Y.Z` deploys too.)
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
