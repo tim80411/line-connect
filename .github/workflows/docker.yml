@@ -18,15 +18,14 @@ jobs:
 
   build:
     needs: test
-    runs-on: ubuntu-latest
+    # Native arm64 runner (free on public repos) — no QEMU emulation;
+    # matches the OCI Ampere (aarch64) cluster.
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -43,7 +42,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=sha,prefix=main-,enable=${{ github.ref == 'refs/heads/main' }}
-      # Cluster is OCI Ampere (aarch64); build arm64 only via QEMU.
       - uses: docker/build-push-action@v6
         with:
           context: .
