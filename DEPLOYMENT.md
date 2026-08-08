@@ -128,6 +128,37 @@ git add apps/line-connect/deployment.yaml && git commit -m "revert(line-connect)
 > deployment.yaml 的 `secretKeyRef` 標了 `optional: true`，所以 key 不存在時
 > pod 照常啟動，只是沒有後台。
 
+**先選路徑**：只加或只換其中一個 key → 走 A（`--merge-into`）。四個值全部重發 → 走 B。
+**預設走 A**——B 要求你手上同時有全部四個明文，每多經手一次就多一次外洩機會。
+
+### A. 只動一個 key（加新 key／輪替單一 key）
+
+`--merge-into` 把新密文加進既有 SealedSecret，其餘 key 的密文一字不動，所以
+**其他三個明文完全不需要經手**。
+
+```bash
+cd ~/self/infra/k8s-apps
+# 值不要用 echo/printf 直接寫在命令列（會進 shell history）；先落到 0600 檔案
+umask 077
+openssl rand -base64 24 > /tmp/lc-newkey        # 若是自訂值就改用 $EDITOR /tmp/lc-newkey
+{
+  printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: line-connect-secret\n  namespace: line-connect\nstringData:\n  ADMIN_PASSWORD: "'
+  tr -d '\n' < /tmp/lc-newkey
+  printf '"\n'
+} > /tmp/lc-one.yaml
+kubeseal --cert sealed-secrets-cert.pem --format yaml \
+  --merge-into apps/line-connect/sealed-secret.yaml < /tmp/lc-one.yaml
+rm -f /tmp/lc-one.yaml                          # 保留 /tmp/lc-newkey 直到存進密碼管理器
+
+# 驗證：git diff 應該只有那一個 key 多／變了一行
+git diff apps/line-connect/sealed-secret.yaml --stat
+```
+
+> `sealed-secrets-cert.pem` 舊了沒關係。controller 每 30 天輪一次 sealing key，
+> 但**保留所有舊私鑰**，所以用半年前的公鑰加密照樣解得開，不必為了加 key 去重抓 cert。
+
+### B. 四個值全部重發
+
 ```bash
 # 1. 填模板（勿 commit 明文）
 cp ~/self/infra/k8s-apps/docs/line-connect-secret.template.yaml /tmp/lc-secret.yaml
@@ -136,8 +167,23 @@ $EDITOR /tmp/lc-secret.yaml
 cd ~/self/infra/k8s-apps
 kubeseal --cert sealed-secrets-cert.pem --format yaml < /tmp/lc-secret.yaml > apps/line-connect/sealed-secret.yaml
 rm /tmp/lc-secret.yaml
-git add apps/line-connect/sealed-secret.yaml && git commit -m "chore(line-connect): rotate secrets" && git push origin main
-# 3. reloader 會自動重啟 pod（deployment 有 reloader.stakater.com/auto）；驗證同上 c/d
+```
+
+### 兩條路徑共用的收尾
+
+```bash
+git add apps/line-connect/sealed-secret.yaml && git commit -m "chore(line-connect): rotate secrets"
+
+# push 前確認是 fast-forward。分支若從舊 main 切出，會少掉 CI 推的 image bump
+# commit，直接推等於把 production 回退一個版本。
+git fetch origin
+git merge-base --is-ancestor origin/main HEAD || git rebase origin/main
+grep 'image: ghcr.io/tim80411/line-connect' apps/line-connect/deployment.yaml   # 版號要是現行版
+git push origin HEAD:main       # main 常被 .claude/worktrees/ 佔用，不必 checkout
+
+# 驗證 controller 真的解得開——新 key 要出現在 Secret 裡才算數（ArgoCD sync 約 1-3 分鐘）
+ssh oci-cp "kubectl get secret line-connect-secret -n line-connect -o jsonpath='{.data}'" | tr ',' '\n' | grep -o '"[A-Z_]*"'
+# reloader 會自動重啟 pod（deployment 有 reloader.stakater.com/auto）；再跑發版驗證 c/d
 ```
 
 ## 不可變的基礎設施約束（改了就會壞，禁止「優化」）
