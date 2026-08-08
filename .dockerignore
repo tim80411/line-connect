@@ -1,0 +1,17 @@
+.git
+.claude
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+tests
+.env
+*.db
+*.db-wal
+*.db-shm
+Makefile
+README.md
