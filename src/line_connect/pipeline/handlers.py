@@ -10,6 +10,7 @@ import mimetypes
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -26,6 +27,7 @@ from line_connect.pipeline.replier import Replier
 from line_connect.storage.repository import InboxJob, Repository
 
 if TYPE_CHECKING:
+    from line_connect.admin.media_store import MediaStore
     from line_connect.pipeline.queue import Pipeline
 
 log = structlog.get_logger(__name__)
@@ -61,6 +63,24 @@ def build_inputs(display_name: str | None, settings: Settings) -> dict[str, Any]
     return inputs
 
 
+@dataclass(frozen=True)
+class Identity:
+    """Who this message is from, in the three forms the pipeline needs.
+
+    `effective_name` is what the AI is told (admin's custom_name wins).
+    `display_name` is the real LINE name — logged as-is so the dashboard can
+    show the original alongside the override.
+    `dify_user` is deliberately NOT affected by custom_name: it keys the Dify
+    end-user identity, so renaming a chat in the dashboard would otherwise fork
+    that user's history. Upstream has this bug (endpoints/line.py:327-329).
+    """
+
+    effective_name: str | None
+    display_name: str | None
+    picture_url: str | None
+    dify_user: str
+
+
 def source_id_of(source: LineSource) -> str:
     return source.group_id or source.room_id or source.user_id or "unknown"
 
@@ -74,6 +94,7 @@ class Bridge:
         dify: DifyClient,
         replier: Replier,
         notifier: Notifier,
+        media: "MediaStore | None" = None,
     ) -> None:
         self._settings = settings
         self._repo = repo
@@ -81,6 +102,7 @@ class Bridge:
         self._dify = dify
         self._replier = replier
         self._notifier = notifier
+        self._media = media
         self._debouncer: MediaDebouncer | None = None
 
     def attach_pipeline(self, pipeline: "Pipeline") -> None:
@@ -133,7 +155,11 @@ class Bridge:
         target = push_target(source)
 
         if text.strip().lower() in self._settings.clear_command_list:
-            await asyncio.to_thread(self._repo.delete_conversation, chat_key)
+            # Only the Dify conversation id is dropped, not the row: the chat's
+            # admin meta (custom_name / notes / tags / starred) has to survive a
+            # user typing /clear. Same semantics as upstream, which only deleted
+            # its cid key.
+            await asyncio.to_thread(self._repo.clear_cid, chat_key)
             await self._replier.send_text(
                 job.id, target, event.reply_token, event.timestamp,
                 self._settings.clear_confirm_message,
@@ -142,29 +168,25 @@ class Bridge:
             return
 
         async with self._loading_indicator(source):
-            display_name = (
-                await self._line.get_display_name(source)
-                if self._settings.pass_display_name
-                else None
-            )
-            dify_user = display_name or source.user_id or "unknown"
+            who = await self._resolve_identity(source, chat_key)
             await asyncio.to_thread(
                 self._repo.ensure_conversation,
-                chat_key, source.type, source_id_of(source), dify_user, display_name,
+                chat_key, source.type, source_id_of(source),
+                who.dify_user, who.display_name, who.picture_url,
             )
             if self._settings.message_log_enabled:
                 await asyncio.to_thread(
                     self._repo.log_message,
                     chat_key, "user", text,
-                    "text", event.message.id, None, display_name, None,
+                    "text", event.message.id, None, who.display_name, None,
                 )
 
             cid = await asyncio.to_thread(self._repo.get_cid, chat_key)
             result, latency_ms = await self._chat_with_cid_protection(
                 chat_key,
                 query=text,
-                dify_user=dify_user,
-                inputs=build_inputs(display_name, self._settings),
+                dify_user=who.dify_user,
+                inputs=build_inputs(who.effective_name, self._settings),
                 cid=cid,
             )
 
@@ -213,15 +235,11 @@ class Bridge:
         kind = "image" if message.type == "image" else "file"
 
         async with self._loading_indicator(source):
-            display_name = (
-                await self._line.get_display_name(source)
-                if self._settings.pass_display_name
-                else None
-            )
-            dify_user = display_name or source.user_id or "unknown"
+            who = await self._resolve_identity(source, chat_key)
             await asyncio.to_thread(
                 self._repo.ensure_conversation,
-                chat_key, source.type, source_id_of(source), dify_user, display_name,
+                chat_key, source.type, source_id_of(source),
+                who.dify_user, who.display_name, who.picture_url,
             )
 
             try:
@@ -239,8 +257,15 @@ class Bridge:
                     )
                 return
 
+            if self._media is not None:
+                # Store what we already have in memory, before Dify sees it —
+                # a failed upload should not cost the operator the image.
+                await self._media.save(chat_key, message.id, data, content_type)
+
             filename, mimetype, dify_type = media_meta(message, content_type)
-            file_info = await self._dify.upload_file(filename, data, mimetype, dify_user)
+            file_info = await self._dify.upload_file(
+                filename, data, mimetype, who.dify_user
+            )
             if file_info is None:
                 if self._settings.debug_mode:
                     await self._replier.send_text(
@@ -258,7 +283,7 @@ class Bridge:
                 await asyncio.to_thread(
                     self._repo.log_message,
                     chat_key, "user", f"[{message.type}]",
-                    message.type, message.id, None, display_name, None,
+                    message.type, message.id, None, who.display_name, None,
                 )
 
             assert self._debouncer is not None, "attach_pipeline() not called"
@@ -271,8 +296,8 @@ class Bridge:
                     job_id=job.id,
                     reply_token=event.reply_token,
                     event_ts_ms=event.timestamp,
-                    dify_user=dify_user,
-                    display_name=display_name,
+                    dify_user=who.dify_user,
+                    effective_name=who.effective_name,
                     target=target,
                 )
                 log.info("media_buffered", chat_key=chat_key, kind=kind, count=count)
@@ -286,8 +311,8 @@ class Bridge:
                 job_id=job.id,
                 reply_token=event.reply_token,
                 event_ts_ms=event.timestamp,
-                dify_user=dify_user,
-                display_name=display_name,
+                dify_user=who.dify_user,
+                effective_name=who.effective_name,
                 target=target,
             )
 
@@ -307,7 +332,7 @@ class Bridge:
             reply_token=buf.reply_token,
             event_ts_ms=buf.event_ts_ms,
             dify_user=buf.dify_user,
-            display_name=buf.display_name,
+            effective_name=buf.effective_name,
             target=buf.target,
         )
 
@@ -322,10 +347,10 @@ class Bridge:
         reply_token: str | None,
         event_ts_ms: int | None,
         dify_user: str,
-        display_name: str | None,
+        effective_name: str | None,
         target: str,
     ) -> None:
-        inputs = build_inputs(display_name, self._settings)
+        inputs = build_inputs(effective_name, self._settings)
         if kind == "image":
             inputs[self._settings.dify_image_variable] = files
             # User's IMAGE_PROMPT wins for a single image; the multi template
@@ -360,6 +385,20 @@ class Bridge:
         await self._replier.send(job_id, target, reply_token, event_ts_ms, messages)
 
     # ── shared plumbing ────────────────────────────────────────────
+
+    async def _resolve_identity(self, source: LineSource, chat_key: str) -> Identity:
+        display_name, picture_url = (
+            await self._line.get_profile(source)
+            if self._settings.pass_display_name
+            else (None, None)
+        )
+        custom_name = await asyncio.to_thread(self._repo.get_custom_name, chat_key)
+        return Identity(
+            effective_name=custom_name or display_name,
+            display_name=display_name,
+            picture_url=picture_url,
+            dify_user=display_name or source.user_id or "unknown",
+        )
 
     async def _chat_with_cid_protection(
         self,

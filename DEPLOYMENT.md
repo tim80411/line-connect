@@ -7,10 +7,16 @@
 
 ```
 LINE OA ──webhook──> line-connect.zhiri.app (Cloudflare proxied)
+營運者 ───/admin───>     │
                         └─> OCI k8s (namespace: line-connect, 單 pod)
                               ├─ SQLite @ PVC /data（對話狀態，唯一有狀態資源）
+                              ├─ 媒體檔 @ PVC /data/media（MEDIA_STORE_ENABLED）
                               └──> Dify Cloud chat-messages API
 ```
+
+公開面兩個：`/line/webhook`（牆＝HMAC 驗簽）與 `/admin`（牆＝ADMIN_PASSWORD →
+24h token；沒設密碼就整組 404）。兩者都登記在 k8s-apps 的
+`security/public-ingress-allowlist.yaml`。
 
 | 資源 | 位置 |
 |---|---|
@@ -74,6 +80,27 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://line-connect.zhiri.app/
 #    問「我剛剛問你什麼」——答得出來 = SQLite cid 存活 ✅
 ```
 
+### 後台上線後追加的驗證（有設 ADMIN_PASSWORD 才做）
+
+```bash
+H=https://line-connect.zhiri.app
+# f. 沒 token 打 action → 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $H/admin \
+  -H 'Content-Type: application/json' -d '{"action":"list_chats"}'          # 401
+# g. 拿密碼當 token → 仍 401（證明沒有上游那個「token 失敗退回吃密碼」的洞）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $H/admin \
+  -H 'Content-Type: application/json' -d '{"action":"list_chats","token":"<ADMIN_PASSWORD>"}'   # 401
+# h. 正常登入拿 token
+curl -s -X POST $H/admin -H 'Content-Type: application/json' \
+  -d '{"action":"login","password":"<ADMIN_PASSWORD>"}'                     # {"token":"…"}
+# i. 頁面出得來
+curl -s -o /dev/null -w '%{http_code}\n' $H/admin                           # 200
+# j. webhook 沒被後台影響
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $H/line/webhook -d '{}'    # 400
+```
+
+沒設 ADMIN_PASSWORD 時，f–i 全部應該回 **404**（路由根本不存在）。
+
 ## Rollback
 
 ```bash
@@ -87,10 +114,19 @@ git add apps/line-connect/deployment.yaml && git commit -m "revert(line-connect)
 
 資料相容注意：若新版加過 DB migration（`storage/migrations/`），舊程式碼讀新 schema
 通常可行（migration 只增不改），但 rollback 跨 migration 前先確認該檔案內容。
+已知：`002_admin.sql` 只有 `ADD COLUMN` 與 `CREATE TABLE`，rollback 到 0.1.x 安全
+（舊程式碼看不到新欄位，也不會寫壞）。
 
 ## Secret 輪替
 
-三個 secret：`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `DIFY_API_KEY`。
+四個 secret：`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `DIFY_API_KEY` /
+`ADMIN_PASSWORD`。
+
+> `ADMIN_PASSWORD` 是後台的唯一一道牆，而後台看得到所有對話紀錄，且掛在公開網域上。
+> **用產生的、不要用想的**：`openssl rand -base64 24`。
+> 留空（或不設這個 key）＝ `/admin` 完全不掛載，回 404。
+> deployment.yaml 的 `secretKeyRef` 標了 `optional: true`，所以 key 不存在時
+> pod 照常啟動，只是沒有後台。
 
 ```bash
 # 1. 填模板（勿 commit 明文）
@@ -127,6 +163,10 @@ git add apps/line-connect/sealed-secret.yaml && git commit -m "chore(line-connec
 | LINE console Verify 失敗 | 多半是 400 vs 200 判定 | 空 events 應回 200：`curl` 帶合法簽章驗證；無簽章 400 是預期 |
 | deploy job 推 k8s-apps 失敗 | main 併發推擠（retry 5 次仍輸）| 重跑 deploy job：`gh run rerun <run-id> --job <deploy-job-id>`，或手動照 Rollback 一節的 sed+push |
 | webhook 收 403（app 沒收到） | Cloudflare WAF 擋非瀏覽器 UA 的測試請求 | LINE 官方流量不受影響；自測用 `curl`（見發版驗證 d） |
+| `/admin` 回 404 | `ADMIN_PASSWORD` 沒進到容器（secret 沒有這個 key，或 key 是空字串） | `ssh oci-cp "kubectl exec -n line-connect deploy/line-connect -- printenv ADMIN_PASSWORD"`；空的就重做 Secret 輪替 |
+| 後台一直被鎖（429） | per-IP 鎖定 5 分鐘；若 ingress 沒帶 `X-Forwarded-For`，所有人共用同一個 IP 身分 | 等 300 秒，或 `kubectl rollout restart`（rate limit 存記憶體，重啟即清） |
+| 登入成功但清單空白 | 該 chat 的 `last_message_at` 是 NULL（被 clear_all_chats 清過，或 migration 前就沒有 user 訊息） | 正常行為；下一則使用者訊息就會回到清單 |
+| 圖片破圖 | `MEDIA_STORE_ENABLED` 沒開，或該圖已被 count/size 淘汰 | 檢查 `MEDIA_STORE_MAX_COUNT` / `MEDIA_STORE_MAX_MB`；舊訊息的圖不會回溯補存 |
 
 ## 觀測
 

@@ -20,6 +20,10 @@ LINE_DATA_API_BASE = "https://api-data.line.me/v2"
 
 PROFILE_CACHE_TTL_SECONDS = 900.0
 PROFILE_CACHE_MAX_ENTRIES = 2048
+BOT_INFO_CACHE_TTL_SECONDS = 3600.0
+
+#: (displayName, pictureUrl) — either may be None if LINE did not return it.
+Profile = tuple[str | None, str | None]
 
 
 class LineClient:
@@ -30,7 +34,8 @@ class LineClient:
             "Authorization": f"Bearer {settings.line_channel_access_token}",
             "Content-Type": "application/json",
         }
-        self._profile_cache: dict[str, tuple[str | None, float]] = {}
+        self._profile_cache: dict[str, tuple[Profile, float]] = {}
+        self._bot_info: tuple[dict[str, Any], float] | None = None
 
     # ── messaging ──────────────────────────────────────────────────
 
@@ -84,9 +89,9 @@ class LineClient:
 
     # ── profile (TTL-cached) ───────────────────────────────────────
 
-    async def get_display_name(self, source: LineSource) -> str | None:
+    async def get_profile(self, source: LineSource) -> Profile:
         if not source.user_id:
-            return None
+            return (None, None)
         cache_key = f"{source.group_id or source.room_id or ''}:{source.user_id}"
         cached = self._profile_cache.get(cache_key)
         now = time.monotonic()
@@ -100,20 +105,44 @@ class LineClient:
         else:
             url = f"{LINE_API_BASE}/bot/profile/{source.user_id}"
 
-        name: str | None = None
+        profile: Profile = (None, None)
         try:
             resp = await self._client.get(
                 url, headers=self._headers, timeout=self._settings.line_api_timeout
             )
             if resp.status_code == 200:
-                name = resp.json().get("displayName")
+                body = resp.json()
+                profile = (body.get("displayName"), body.get("pictureUrl"))
         except httpx.TransportError as exc:
             log.debug("line_profile_transport_error", error=str(exc))
 
         if len(self._profile_cache) >= PROFILE_CACHE_MAX_ENTRIES:
             self._profile_cache.pop(next(iter(self._profile_cache)))
-        self._profile_cache[cache_key] = (name, now + PROFILE_CACHE_TTL_SECONDS)
-        return name
+        self._profile_cache[cache_key] = (profile, now + PROFILE_CACHE_TTL_SECONDS)
+        return profile
+
+    async def get_display_name(self, source: LineSource) -> str | None:
+        return (await self.get_profile(source))[0]
+
+    async def get_bot_info(self) -> dict[str, Any]:
+        """Official-account name / icon, cached for an hour. Used by the admin
+        login screen (unauthenticated, same trade-off as upstream)."""
+        now = time.monotonic()
+        if self._bot_info is not None and self._bot_info[1] > now:
+            return self._bot_info[0]
+        info: dict[str, Any] = {}
+        try:
+            resp = await self._client.get(
+                f"{LINE_API_BASE}/bot/info",
+                headers=self._headers,
+                timeout=self._settings.line_api_timeout,
+            )
+            if resp.status_code == 200:
+                info = resp.json()
+        except httpx.TransportError as exc:
+            log.debug("line_bot_info_transport_error", error=str(exc))
+        self._bot_info = (info, now + BOT_INFO_CACHE_TTL_SECONDS)
+        return info
 
     # ── content download (P5) ──────────────────────────────────────
 

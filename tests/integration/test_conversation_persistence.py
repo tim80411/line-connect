@@ -119,6 +119,13 @@ async def test_clear_command(tmp_path: Path, mock_apis: Any) -> None:
         await app.state.pipeline.idle()
         assert app.state.repo.get_cid("user:U1") == "c-1"
 
+        # Admin annotations set through the dashboard must survive /clear.
+        with app.state.db.locked() as conn:
+            conn.execute(
+                "UPDATE conversations SET custom_name = 'VIP', notes = 'n',"
+                " tags = '[\"vip\"]', starred = 1 WHERE chat_key = 'user:U1'"
+            )
+
         await post_signed(
             client,
             settings.webhook_path,
@@ -128,9 +135,13 @@ async def test_clear_command(tmp_path: Path, mock_apis: Any) -> None:
         assert app.state.repo.get_cid("user:U1") is None
         with app.state.db.locked() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS n FROM conversations WHERE chat_key = 'user:U1'"
+                "SELECT custom_name, notes, tags, starred FROM conversations"
+                " WHERE chat_key = 'user:U1'"
             ).fetchone()
-        assert row["n"] == 0, "/clear must delete the conversation row"
+        assert row is not None, "/clear must keep the conversation row"
+        assert (row["custom_name"], row["notes"], row["tags"], row["starred"]) == (
+            "VIP", "n", '["vip"]', 1,
+        ), "/clear must not touch admin meta"
 
         await post_signed(
             client,

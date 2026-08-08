@@ -13,6 +13,7 @@ import structlog
 from fastapi import FastAPI
 
 from line_connect import __version__
+from line_connect.admin.media_store import MediaStore
 from line_connect.api import health
 from line_connect.api.webhook import line_webhook
 from line_connect.config import Settings
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     db = Database(settings.database_path)
     db.connect()
+    db.connect_read()
     app.state.db = db
     repo = Repository(db)
     app.state.repo = repo
@@ -44,8 +46,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     dify = DifyClient(settings, http_client)
     replier = Replier(settings, line, repo)
     notifier = Notifier(settings, replier)
-    bridge = Bridge(settings, repo, line, dify, replier, notifier)
+
+    media: MediaStore | None = None
+    if settings.media_store_enabled:
+        media = MediaStore(settings, db)
+        media.ensure_root()
+    app.state.media = media
+
+    bridge = Bridge(settings, repo, line, dify, replier, notifier, media)
     app.state.bridge = bridge
+    app.state.line = line
+
+    if settings.admin_enabled:
+        from line_connect.admin.auth import AuthService
+        from line_connect.admin.repository import AdminRepository
+
+        admin_repo = AdminRepository(db)
+        app.state.admin_repo = admin_repo
+        app.state.admin_auth = AuthService(settings, admin_repo)
 
     pipeline = Pipeline(
         settings,
@@ -99,4 +117,10 @@ def create_app(
     app.state.failure_hook_override = on_failure
     app.include_router(health.router)
     app.add_api_route(settings.webhook_path, line_webhook, methods=["POST"])
+    if settings.admin_enabled:
+        # Imported only when enabled: with no ADMIN_PASSWORD the admin package
+        # is never loaded and the routes simply do not exist (fail-closed).
+        from line_connect.api.admin import build_router
+
+        app.include_router(build_router(settings))
     return app

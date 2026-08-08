@@ -33,7 +33,8 @@ class MediaBuffer:
     reply_token: str | None = None
     event_ts_ms: int | None = None
     dify_user: str = "unknown"
-    display_name: str | None = None
+    # The name the AI is told — admin custom_name wins over the LINE profile.
+    effective_name: str | None = None
     target: str = ""
     timer: asyncio.Task[None] | None = None
 
@@ -61,7 +62,7 @@ class MediaDebouncer:
         reply_token: str | None,
         event_ts_ms: int | None,
         dify_user: str,
-        display_name: str | None,
+        effective_name: str | None,
         target: str,
     ) -> int:
         """Buffer one uploaded file and (re)arm the timer. Returns batch size.
@@ -77,7 +78,7 @@ class MediaDebouncer:
         buf.reply_token = reply_token
         buf.event_ts_ms = event_ts_ms
         buf.dify_user = dify_user
-        buf.display_name = display_name
+        buf.effective_name = effective_name
         buf.target = target
         if buf.timer is not None:
             buf.timer.cancel()

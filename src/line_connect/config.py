@@ -71,6 +71,25 @@ class Settings(BaseSettings):
     log_format: Literal["json", "console"] = "json"
     webhook_path: str = "/line/webhook"
 
+    # --- admin dashboard ---
+    # Empty password = the whole admin surface is never mounted (fail-closed).
+    admin_password: str = ""
+    admin_path: str = "/admin"
+    admin_token_ttl_hours: int = 24
+    admin_max_tokens: int = 10
+    admin_login_max_attempts: int = 5
+    admin_login_lockout_seconds: int = 300
+    # Rate-limit identity: first hop of X-Forwarded-For, else request.client.host.
+    admin_trust_proxy_headers: bool = True
+    admin_history_limit: int = 200
+    admin_export_max_rows: int = 50000
+
+    # --- media library (admin) ---
+    media_store_enabled: bool = False
+    media_dir: str = "/data/media"
+    media_store_max_count: int = 500
+    media_store_max_mb: int = 200
+
     @property
     def clear_command_list(self) -> tuple[str, ...]:
         return tuple(c.strip().lower() for c in self.clear_commands.split(",") if c.strip())
@@ -84,3 +103,11 @@ class Settings(BaseSettings):
     @property
     def media_max_download_bytes(self) -> int:
         return self.media_max_download_mb * 1024 * 1024
+
+    @property
+    def media_store_max_bytes(self) -> int:
+        return self.media_store_max_mb * 1024 * 1024
+
+    @property
+    def admin_enabled(self) -> bool:
+        return bool(self.admin_password)

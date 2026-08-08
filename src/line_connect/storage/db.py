@@ -37,12 +37,21 @@ def utc_cutoff_iso(age_seconds: float) -> str:
 
 
 class Database:
-    """Owns the single write connection. All access goes through `locked()`."""
+    """Owns the write connection (`locked()`) and a second read-only connection
+    (`locked_ro()`).
+
+    The read-only connection exists for the admin dashboard: under WAL a reader
+    never blocks the writer, so an analytics scan over the whole `messages`
+    table cannot stall a webhook's inbox INSERT. It has its own lock, so admin
+    reads and pipeline writes are only serialized against their own kind.
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        self._ro_conn: sqlite3.Connection | None = None
+        self._ro_lock = threading.Lock()
 
     def connect(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -59,10 +68,26 @@ class Database:
         self._conn = conn
         self._migrate()
 
+    def connect_read(self) -> None:
+        """Open the read-only connection. Call after connect() — the file and
+        its schema must already exist, and mode=ro refuses to create either."""
+        conn = sqlite3.connect(
+            f"file:{self.path}?mode=ro",
+            uri=True,
+            check_same_thread=False,  # guarded by self._ro_lock
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        self._ro_conn = conn
+
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        if self._ro_conn is not None:
+            self._ro_conn.close()
+            self._ro_conn = None
 
     @contextmanager
     def locked(self) -> Iterator[sqlite3.Connection]:
@@ -70,6 +95,20 @@ class Database:
             raise RuntimeError("Database not connected")
         with self._lock:
             yield self._conn
+
+    @contextmanager
+    def locked_ro(self) -> Iterator[sqlite3.Connection]:
+        """Read-only connection if one is open, else the write connection.
+
+        The fallback keeps unit tests (which only call connect()) working and
+        makes connect_read() an optimization rather than a precondition.
+        """
+        if self._ro_conn is None:
+            with self.locked() as conn:
+                yield conn
+            return
+        with self._ro_lock:
+            yield self._ro_conn
 
     async def ping(self) -> None:
         """Readiness check: prove the DB file is still reachable and writable."""

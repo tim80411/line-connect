@@ -1,7 +1,11 @@
 """Repository tests against a real SQLite file (plan §7.4)."""
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from line_connect.storage.db import Database, utc_cutoff_iso
 from line_connect.storage.repository import Repository
@@ -33,7 +37,7 @@ class TestDatabase:
         with second.locked() as conn:
             versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations")]
         second.close()
-        assert versions == [1]
+        assert versions == [1, 2]
 
 
 class TestDedup:
@@ -61,11 +65,42 @@ class TestConversation:
         repo.clear_cid("user:U1")
         assert repo.get_cid("user:U1") is None
 
-    def test_delete_conversation(self, repo: Repository) -> None:
-        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", None)
+    def test_clear_cid_keeps_admin_meta(self, repo: Repository) -> None:
+        """/clear drops the Dify conversation, never the admin's annotations."""
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim")
         repo.set_cid("user:U1", "cid-123")
-        repo.delete_conversation("user:U1")
+        with repo._db.locked() as conn:
+            conn.execute(
+                "UPDATE conversations SET custom_name = 'VIP', notes = 'call back',"
+                " tags = '[\"vip\"]', starred = 1 WHERE chat_key = 'user:U1'"
+            )
+        repo.clear_cid("user:U1")
         assert repo.get_cid("user:U1") is None
+        with repo._db.locked() as conn:
+            row = conn.execute(
+                "SELECT custom_name, notes, tags, starred FROM conversations"
+                " WHERE chat_key = 'user:U1'"
+            ).fetchone()
+        assert (row["custom_name"], row["notes"], row["tags"], row["starred"]) == (
+            "VIP", "call back", '["vip"]', 1,
+        )
+
+    def test_get_custom_name(self, repo: Repository) -> None:
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim")
+        assert repo.get_custom_name("user:U1") is None
+        assert repo.get_custom_name("user:missing") is None
+        with repo._db.locked() as conn:
+            conn.execute("UPDATE conversations SET custom_name = 'VIP'")
+        assert repo.get_custom_name("user:U1") == "VIP"
+
+    def test_upsert_preserves_picture_url_when_null(self, repo: Repository) -> None:
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim", "http://p/1")
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim", None)
+        with repo._db.locked() as conn:
+            row = conn.execute(
+                "SELECT picture_url FROM conversations WHERE chat_key = 'user:U1'"
+            ).fetchone()
+        assert row["picture_url"] == "http://p/1"
 
     def test_upsert_preserves_display_name_when_null(self, repo: Repository) -> None:
         repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim")
@@ -190,3 +225,83 @@ class TestRetention:
         assert purged_msgs == 1
         remaining = repo.count_by_status()
         assert remaining == {"done": 1, "pending": 1}
+
+
+class TestDenormalization:
+    """log_message keeps conversations' inbox-list columns current (§3)."""
+
+    def _row(self, repo: Repository) -> Any:
+        with repo._db.locked() as conn:
+            return conn.execute(
+                "SELECT last_message_at, last_message_text, message_count"
+                " FROM conversations WHERE chat_key = 'user:U1'"
+            ).fetchone()
+
+    def test_user_message_bumps_last_message(self, repo: Repository) -> None:
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim")
+        repo.log_message("user:U1", "user", "hello there")
+        row = self._row(repo)
+        assert row["last_message_text"] == "hello there"
+        assert row["message_count"] == 1
+        with repo._db.locked() as conn:
+            msg_ts = conn.execute("SELECT created_at FROM messages").fetchone()[0]
+        assert row["last_message_at"] == msg_ts
+
+    def test_bot_message_counts_but_does_not_bump(self, repo: Repository) -> None:
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", "Tim")
+        repo.log_message("user:U1", "user", "question")
+        before = self._row(repo)["last_message_at"]
+        repo.log_message("user:U1", "bot", "answer", latency_ms=1200)
+        row = self._row(repo)
+        assert row["message_count"] == 2
+        assert row["last_message_at"] == before
+        assert row["last_message_text"] == "question"
+
+    def test_preview_truncated_to_80_chars(self, repo: Repository) -> None:
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", None)
+        repo.log_message("user:U1", "user", "x" * 200)
+        assert self._row(repo)["last_message_text"] == "x" * 80
+
+    def test_media_message_previews_its_type(self, repo: Repository) -> None:
+        repo.ensure_conversation("user:U1", "user", "U1", "line-U1", None)
+        repo.log_message("user:U1", "user", "[image]", msg_type="image")
+        assert self._row(repo)["last_message_text"] == "[image]"
+
+    def test_orphan_chat_key_does_not_raise(self, repo: Repository) -> None:
+        repo.log_message("user:nobody", "user", "hi")  # no conversations row
+        with repo._db.locked() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+
+
+class TestReadOnlyConnection:
+    def test_reads_see_committed_writes(self, tmp_path: Path) -> None:
+        db = Database(str(tmp_path / "ro.db"))
+        db.connect()
+        db.connect_read()
+        try:
+            Repository(db).ensure_conversation("user:U1", "user", "U1", "u", "Tim")
+            with db.locked_ro() as conn:
+                row = conn.execute(
+                    "SELECT display_name FROM conversations WHERE chat_key = 'user:U1'"
+                ).fetchone()
+            assert row["display_name"] == "Tim"
+        finally:
+            db.close()
+
+    def test_writes_are_rejected(self, tmp_path: Path) -> None:
+        db = Database(str(tmp_path / "ro.db"))
+        db.connect()
+        db.connect_read()
+        try:
+            with (
+                pytest.raises(sqlite3.OperationalError, match="readonly"),
+                db.locked_ro() as conn,
+            ):
+                conn.execute("DELETE FROM conversations")
+        finally:
+            db.close()
+
+    def test_falls_back_to_write_connection(self, db: Database) -> None:
+        """connect_read() is an optimization, not a precondition."""
+        with db.locked_ro() as conn:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1

@@ -14,6 +14,7 @@ from line_connect.storage.db import Database, utc_cutoff_iso, utc_now_iso
 log = structlog.get_logger(__name__)
 
 MAX_STORED_ERROR_LEN = 2000
+LAST_MESSAGE_PREVIEW_LEN = 80
 
 
 @dataclass(frozen=True)
@@ -43,21 +44,41 @@ class Repository:
         source_id: str,
         dify_user: str,
         display_name: str | None = None,
+        picture_url: str | None = None,
     ) -> None:
         now = utc_now_iso()
         with self._db.locked() as conn:
             conn.execute(
                 """
                 INSERT INTO conversations(chat_key, source_type, source_id, dify_user,
-                                          display_name, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                          display_name, picture_url, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_key) DO UPDATE SET
                     dify_user = excluded.dify_user,
                     display_name = COALESCE(excluded.display_name, display_name),
+                    picture_url = COALESCE(excluded.picture_url, picture_url),
                     updated_at = excluded.updated_at
                 """,
-                (chat_key, source_type, source_id, dify_user, display_name, now, now),
+                (
+                    chat_key,
+                    source_type,
+                    source_id,
+                    dify_user,
+                    display_name,
+                    picture_url,
+                    now,
+                    now,
+                ),
             )
+
+    def get_custom_name(self, chat_key: str) -> str | None:
+        """Admin-assigned display name override. Primary-key lookup on the hot
+        path — read via the read-only connection so it never waits on a write."""
+        with self._db.locked_ro() as conn:
+            row = conn.execute(
+                "SELECT custom_name FROM conversations WHERE chat_key = ?", (chat_key,)
+            ).fetchone()
+        return row["custom_name"] if row else None
 
     def get_cid(self, chat_key: str) -> str | None:
         with self._db.locked() as conn:
@@ -81,9 +102,9 @@ class Repository:
                 (utc_now_iso(), chat_key),
             )
 
-    def delete_conversation(self, chat_key: str) -> None:
-        with self._db.locked() as conn:
-            conn.execute("DELETE FROM conversations WHERE chat_key = ?", (chat_key,))
+    # NOTE: there is deliberately no delete_conversation(). The /clear command
+    # calls clear_cid() instead — dropping the row would also drop the admin
+    # meta (custom_name / notes / tags / starred) an operator set on that chat.
 
     # ── inbox: dedup + durable job queue ───────────────────────────
 
@@ -274,6 +295,7 @@ class Repository:
         display_name: str | None = None,
         latency_ms: int | None = None,
     ) -> None:
+        now = utc_now_iso()
         with self._db.locked() as conn:
             conn.execute(
                 """
@@ -290,6 +312,24 @@ class Repository:
                     conversation_id,
                     display_name,
                     latency_ms,
-                    utc_now_iso(),
+                    now,
                 ),
             )
+            # Denormalize into conversations so the 5s-polled inbox list is a
+            # single index scan instead of a per-chat correlated subquery over
+            # messages. Same lock, same transaction-less autocommit step.
+            if role == "user":
+                # Only user messages bump last_message_*: the dashboard compares
+                # it against a per-chat "last read" marker, and a bot reply
+                # bumping it would make every answered chat look unread again.
+                conn.execute(
+                    "UPDATE conversations SET message_count = message_count + 1,"
+                    " last_message_at = ?, last_message_text = ? WHERE chat_key = ?",
+                    (now, (text or "")[:LAST_MESSAGE_PREVIEW_LEN], chat_key),
+                )
+            else:
+                conn.execute(
+                    "UPDATE conversations SET message_count = message_count + 1"
+                    " WHERE chat_key = ?",
+                    (chat_key,),
+                )
