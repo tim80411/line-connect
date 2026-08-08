@@ -28,6 +28,42 @@ issue #1（對話重置成開場白／request timeout）。
   （image 與 file 不互相污染）。
 - **Graceful shutdown**：readyz 先轉紅 → drain → 未完成 job 留 DB 下次啟動回收。
 
+## 路由一覽
+
+服務只開這幾條路，其餘一律 404（沒有 `/docs`、`/openapi.json`——三者在 `create_app` 明確關掉）。
+
+| 路由 | 方法 | 牆 | 說明 |
+|---|---|---|---|
+| `/line/webhook` | POST | HMAC-SHA256 驗簽 | LINE 送 event 進來。簽章不符回 400 且完全不處理。路徑可用 `WEBHOOK_PATH` 改 |
+| `/healthz` | GET | 無 | liveness。**不碰 DB／Dify**——外部依賴掛掉不該重啟 pod |
+| `/readyz` | GET | 無 | readiness。查 DB 可寫與是否 draining；紅了就從 Endpoints 移除 |
+| `/admin` | GET | 頁內登入牆 | 後台 SPA（單一 HTML，CSS/JS 內嵌）。路徑可用 `ADMIN_PATH` 改 |
+| `/admin` | POST | token（`login` 除外） | 後台 API，單一端點 + body 的 `action` 欄位分派 |
+
+**`ADMIN_PASSWORD` 沒設時，兩條 `/admin` 都是 404**——不是 401，是路由根本不存在。
+
+### `POST /admin` 的 action（20 個）
+
+Body 一律 `{"action": "...", "token": "...", ...參數}`。
+
+| 免認證 | 說明 |
+|---|---|
+| `login` | 密碼換 token。per-IP 5 次失敗鎖 300 秒 |
+| `get_bot_info` | OA 名稱與頭像，登入畫面品牌用（沿用上游取捨） |
+| `health` | 版本號 |
+
+| 需 token | 分類 |
+|---|---|
+| `list_chats` `get_history` `get_chat_meta` `update_chat_meta` | 對話 |
+| `send_message` `clear_history` `clear_all_chats` `export_chat` | 操作 |
+| `get_analytics` `get_analytics_realtime` `get_performance` `get_storage_info` `export_analytics` | 分析 |
+| `manage_tags` `manage_templates` | 標籤／範本 |
+| `get_image` | 媒體（回 binary，非 JSON） |
+| `get_schedule` | Phase B 的良性 stub，回空排程 |
+
+Phase B 的 action（`toggle_bot` / `toggle_all` / `set_schedule` / `get|set_autoreply` /
+`broadcast` / `list_broadcasts` / `search_*`）**沒有實作**，打了回 400 `unknown action`。
+
 ## 管理後台（Admin Dashboard）
 
 移植自上游 plugin 的營運後台（vanilla JS SPA，無 build step）。**預設不存在**：
