@@ -1,9 +1,10 @@
-name: Build and push image
+name: CI / Release deploy
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+  release:
+    types: [published]
 
 jobs:
   test:
@@ -37,10 +38,12 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
+          # Releases (vX.Y.Z tag) produce the immutable X.Y.Z tag that the
+          # deploy job pins in k8s-apps. Plain main pushes only produce
+          # main-<sha> for ad-hoc testing — they never deploy.
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=0.1.0,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=main-,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=main-,enable=${{ github.event_name == 'push' }}
       # Cluster is OCI Ampere (aarch64); build arm64 only via QEMU.
       - uses: docker/build-push-action@v6
         with:
@@ -51,3 +54,37 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    # Publishing a GitHub Release is the deploy trigger: bump the image tag in
+    # k8s-apps and let ArgoCD roll it out.
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tim80411/k8s-apps
+          ssh-key: ${{ secrets.K8S_APPS_DEPLOY_KEY }}
+          ref: main
+      - name: Bump image tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i -E "s|(image: ghcr.io/tim80411/line-connect:).*|\1${VERSION}|" \
+            apps/line-connect/deployment.yaml
+          grep 'image: ghcr.io/tim80411/line-connect' apps/line-connect/deployment.yaml
+      - name: Commit and push (retry on concurrent pushes)
+        run: |
+          git config user.name "line-connect-release"
+          git config user.email "noreply@github.com"
+          git add apps/line-connect/deployment.yaml
+          if git diff --cached --quiet; then
+            echo "image tag unchanged; nothing to deploy"
+            exit 0
+          fi
+          git commit -m "chore(line-connect): deploy ${GITHUB_REF_NAME} (release-triggered)"
+          for i in 1 2 3 4 5; do
+            git push origin main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1
