@@ -37,20 +37,35 @@ async def test_reply_400_falls_back_to_push(tmp_path: Path, mock_apis: Any) -> N
     assert body["messages"][0]["text"] == "hi"
 
 
-async def test_stale_token_goes_straight_to_push(tmp_path: Path, mock_apis: Any) -> None:
-    """Event older than REPLY_TOKEN_TTL: don't waste the doomed reply call."""
+async def test_redelivered_event_still_replies(tmp_path: Path, mock_apis: Any) -> None:
+    """LINE restarts the token's minute when it redelivers, so an event that
+    arrives 90s after the user sent it still gets a free reply. Measuring age
+    from event.timestamp sent every such message as a billed push."""
     mock_apis.post(DIFY_CHAT_URL).mock(return_value=dify_stream_answer("hi", "c-1"))
     settings = make_settings(tmp_path, reply_token_ttl_seconds=50)
-    stale_ts = int(time.time() * 1000) - 90_000  # 90s ago
+    event = text_event(timestamp=int(time.time() * 1000) - 90_000)
+    event["deliveryContext"] = {"isRedelivery": True}
     async with running_app(settings) as app, asgi_client(app) as client:
-        await post_signed(
-            client,
-            settings.webhook_path,
-            webhook_payload(text_event(timestamp=stale_ts)),
-        )
+        await post_signed(client, settings.webhook_path, webhook_payload(event))
         await app.state.pipeline.idle()
 
-    assert mock_apis["reply"].call_count == 0, "no reply attempt on an expired token"
+    assert mock_apis["reply"].call_count == 1
+    assert mock_apis["push"].call_count == 0
+
+
+async def test_event_past_line_limit_goes_straight_to_push(
+    tmp_path: Path, mock_apis: Any
+) -> None:
+    """LINE refuses any token 20 minutes after the event: don't waste the call."""
+    mock_apis.post(DIFY_CHAT_URL).mock(return_value=dify_stream_answer("hi", "c-1"))
+    settings = make_settings(tmp_path)
+    event = text_event(timestamp=int(time.time() * 1000) - 21 * 60_000)
+    event["deliveryContext"] = {"isRedelivery": True}
+    async with running_app(settings) as app, asgi_client(app) as client:
+        await post_signed(client, settings.webhook_path, webhook_payload(event))
+        await app.state.pipeline.idle()
+
+    assert mock_apis["reply"].call_count == 0, "no reply attempt on a dead token"
     assert mock_apis["push"].call_count == 1
 
 

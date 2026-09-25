@@ -12,7 +12,7 @@ import structlog
 from line_connect.config import Settings
 from line_connect.line.events import LineEvent
 from line_connect.line.messages import push_target
-from line_connect.pipeline.replier import Replier
+from line_connect.pipeline.replier import Replier, reply_token_of
 from line_connect.storage.repository import InboxJob
 
 log = structlog.get_logger(__name__)
@@ -58,9 +58,7 @@ class Notifier:
             target = push_target(event.source)
             if not target:
                 return
-            await self._replier.send_text(
-                job.id, target, job.reply_token, job.event_ts_ms, text
-            )
+            await self._replier.send_text(job.id, target, reply_token_of(job), text)
         except Exception:
             # Notification is best-effort; never let it cascade.
             log.exception("notify_failed", chat_key=job.chat_key)

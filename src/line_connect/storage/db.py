@@ -31,6 +31,11 @@ def utc_now_iso() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
+def iso_to_ms(value: str) -> int:
+    """Epoch milliseconds for a timestamp written by utc_now_iso()."""
+    return int(datetime.fromisoformat(value).timestamp() * 1000)
+
+
 def utc_cutoff_iso(age_seconds: float) -> str:
     cutoff = datetime.now(UTC) - timedelta(seconds=age_seconds)
     return cutoff.strftime("%Y-%m-%dT%H:%M:%S.") + f"{cutoff.microsecond // 1000:03d}Z"

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import structlog
 
-from line_connect.storage.db import Database, utc_cutoff_iso, utc_now_iso
+from line_connect.storage.db import Database, iso_to_ms, utc_cutoff_iso, utc_now_iso
 
 log = structlog.get_logger(__name__)
 
@@ -29,6 +29,12 @@ class InboxJob:
     event_ts_ms: int | None
     attempts: int
     reply_sent_at: str | None
+    #: Set at INSERT, i.e. when the delivery that got claimed reached us.
+    enqueued_at: str | None = None
+
+    @property
+    def received_ms(self) -> int | None:
+        return iso_to_ms(self.enqueued_at) if self.enqueued_at else None
 
 
 class Repository:
@@ -162,6 +168,7 @@ class Repository:
             event_ts_ms=row["event_ts_ms"],
             attempts=row["attempts"],
             reply_sent_at=row["reply_sent_at"],
+            enqueued_at=row["enqueued_at"],
         )
 
     def mark_processing(self, row_id: int) -> None:
@@ -240,6 +247,7 @@ class Repository:
                                 event_ts_ms=row["event_ts_ms"],
                                 attempts=row["attempts"],
                                 reply_sent_at=row["reply_sent_at"],
+                                enqueued_at=row["enqueued_at"],
                             )
                         )
                 conn.execute("COMMIT")

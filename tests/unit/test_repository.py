@@ -1,6 +1,7 @@
 """Repository tests against a real SQLite file (plan §7.4)."""
 
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -305,3 +306,27 @@ class TestReadOnlyConnection:
         """connect_read() is an optimization, not a precondition."""
         with db.locked_ro() as conn:
             assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+class TestReceiptTime:
+    """received_ms drives the reply-token window (LINE's clock starts when a
+    delivery reaches us), so every path that hands out a job must carry it."""
+
+    def test_claimed_job_carries_receipt_time(self, repo: Repository) -> None:
+        before = int(time.time() * 1000)
+        row_id = claim(repo)
+        after = int(time.time() * 1000)
+        assert row_id is not None
+        job = repo.get_job(row_id)
+        assert job is not None
+        assert job.received_ms is not None
+        assert before - 1 <= job.received_ms <= after + 1
+        assert job.event_ts_ms == 1_700_000_000_000, "event time is kept separately"
+
+    def test_recovered_job_keeps_original_receipt_time(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        original = repo.get_job(row_id)
+        assert original is not None
+        [recovered] = repo.recover_orphans(max_age_seconds=3600)
+        assert recovered.received_ms == original.received_ms
