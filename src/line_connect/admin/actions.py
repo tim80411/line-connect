@@ -193,7 +193,10 @@ async def send_message(ctx: AdminContext, body: dict[str, Any]) -> ActionResult:
         "{username}", row["custom_name"] or row["display_name"] or "User"
     ).replace("{account_name}", bot_info.get("displayName") or "LINE Official Account")
 
-    if not await ctx.line.push(target, [text_msg(text)]):
+    result = await ctx.line.push(target, [text_msg(text)])
+    if result.quota_exhausted:
+        return {"error": "LINE monthly message quota exhausted"}, 502
+    if not result.ok:
         return {"error": "LINE push failed"}, 502
     await asyncio.to_thread(ctx.repo.log_admin_message, chat_id, text)
     return {"ok": True, "sent_to": target}

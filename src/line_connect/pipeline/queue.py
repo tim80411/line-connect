@@ -13,6 +13,7 @@ crash loses nothing but in-flight work, which startup recovery re-enqueues.
 
 import asyncio
 import json
+import time
 import zlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -147,6 +148,20 @@ class Pipeline:
                 redelivery=event.delivery_context.is_redelivery,
             )
             return None
+        # redelivery=true on a *claimed* row means no earlier attempt of this
+        # event ever reached us; event_age_ms says how late this one arrived.
+        log.info(
+            "event_claimed",
+            job_id=row_id,
+            dedup_key=dedup_key,
+            chat_key=chat_key,
+            redelivery=event.delivery_context.is_redelivery,
+            event_age_ms=(
+                int(time.time() * 1000) - event.timestamp
+                if event.timestamp is not None
+                else None
+            ),
+        )
         self._enqueue(row_id, chat_key)
         return row_id
 

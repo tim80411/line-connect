@@ -322,6 +322,22 @@ async def test_send_message_pushes_and_logs(seeded: Any, mock_apis: Any) -> None
     assert chat["mc"] == 3
 
 
+async def test_send_message_names_a_spent_quota(seeded: Any, mock_apis: Any) -> None:
+    _app, client, token = seeded
+    mock_apis.get("https://api.line.me/v2/bot/info", name="botinfo").mock(
+        return_value=httpx.Response(200, json={"displayName": "Nani OA"})
+    )
+    mock_apis["push"].mock(
+        return_value=httpx.Response(
+            429, json={"message": "You have reached your monthly limit."}
+        )
+    )
+
+    resp = await call(client, "send_message", token=token, chat_id="user:U1", text="hi")
+    assert resp.status_code == 502
+    assert resp.json() == {"error": "LINE monthly message quota exhausted"}
+
+
 async def test_send_message_validation(seeded: Any) -> None:
     _app, client, token = seeded
     assert (await call(client, "send_message", token=token, text="hi")).status_code == 400

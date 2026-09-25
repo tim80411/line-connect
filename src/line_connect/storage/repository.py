@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import structlog
 
-from line_connect.storage.db import Database, utc_cutoff_iso, utc_now_iso
+from line_connect.storage.db import Database, iso_to_ms, utc_cutoff_iso, utc_now_iso
 
 log = structlog.get_logger(__name__)
 
@@ -29,6 +29,12 @@ class InboxJob:
     event_ts_ms: int | None
     attempts: int
     reply_sent_at: str | None
+    #: Set at INSERT, i.e. when the delivery that got claimed reached us.
+    enqueued_at: str | None = None
+
+    @property
+    def received_ms(self) -> int | None:
+        return iso_to_ms(self.enqueued_at) if self.enqueued_at else None
 
 
 class Repository:
@@ -162,6 +168,7 @@ class Repository:
             event_ts_ms=row["event_ts_ms"],
             attempts=row["attempts"],
             reply_sent_at=row["reply_sent_at"],
+            enqueued_at=row["enqueued_at"],
         )
 
     def mark_processing(self, row_id: int) -> None:
@@ -173,9 +180,12 @@ class Repository:
             )
 
     def mark_done(self, row_id: int) -> None:
+        # A job whose answer could not be delivered keeps saying so:
+        # mark_delivery_failed runs while the handler is still in flight.
         with self._db.locked() as conn:
             conn.execute(
-                "UPDATE inbox SET status = 'done', finished_at = ? WHERE id = ?",
+                "UPDATE inbox SET status = 'done', finished_at = ?"
+                " WHERE id = ? AND status != 'delivery_failed'",
                 (utc_now_iso(), row_id),
             )
 
@@ -185,6 +195,20 @@ class Repository:
                 "UPDATE inbox SET status = 'failed', finished_at = ?, last_error = ?"
                 " WHERE id = ?",
                 (utc_now_iso(), error[:MAX_STORED_ERROR_LEN], row_id),
+            )
+
+    def mark_delivery_failed(self, row_id: int, reason: str) -> None:
+        """The job ran but its answer never reached the user.
+
+        'done' would claim otherwise. Applies to jobs still in flight or
+        already done (a debounced batch flushes after its job finished); a
+        'failed' job keeps its original error rather than this follow-on one.
+        """
+        with self._db.locked() as conn:
+            conn.execute(
+                "UPDATE inbox SET status = 'delivery_failed', finished_at = ?,"
+                " last_error = ? WHERE id = ? AND status IN ('processing', 'done')",
+                (utc_now_iso(), reason[:MAX_STORED_ERROR_LEN], row_id),
             )
 
     def mark_reply_sent(self, row_id: int) -> None:
@@ -240,6 +264,7 @@ class Repository:
                                 event_ts_ms=row["event_ts_ms"],
                                 attempts=row["attempts"],
                                 reply_sent_at=row["reply_sent_at"],
+                                enqueued_at=row["enqueued_at"],
                             )
                         )
                 conn.execute("COMMIT")
@@ -273,7 +298,8 @@ class Repository:
         msg_cutoff = utc_cutoff_iso(message_retention_days * 86400)
         with self._db.locked() as conn:
             cur1 = conn.execute(
-                "DELETE FROM inbox WHERE status IN ('done', 'failed', 'abandoned')"
+                "DELETE FROM inbox WHERE status IN"
+                " ('done', 'failed', 'abandoned', 'delivery_failed')"
                 " AND enqueued_at < ?",
                 (inbox_cutoff,),
             )

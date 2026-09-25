@@ -20,6 +20,8 @@ from typing import Any
 
 import structlog
 
+from line_connect.line.reply_token import NO_REPLY_TOKEN, ReplyToken
+
 log = structlog.get_logger(__name__)
 
 BufferKey = tuple[str, str]  # (chat_key, kind)
@@ -30,8 +32,7 @@ class MediaBuffer:
     files: list[dict[str, Any]] = field(default_factory=list)
     msg_labels: list[str] = field(default_factory=list)  # LINE message types
     last_job_id: int = 0
-    reply_token: str | None = None
-    event_ts_ms: int | None = None
+    reply_token: ReplyToken = NO_REPLY_TOKEN
     dify_user: str = "unknown"
     # The name the AI is told — admin custom_name wins over the LINE profile.
     effective_name: str | None = None
@@ -59,8 +60,7 @@ class MediaDebouncer:
         file_obj: dict[str, Any],
         msg_label: str,
         job_id: int,
-        reply_token: str | None,
-        event_ts_ms: int | None,
+        reply_token: ReplyToken,
         dify_user: str,
         effective_name: str | None,
         target: str,
@@ -76,7 +76,6 @@ class MediaDebouncer:
         buf.last_job_id = job_id
         # Newest token: most likely still valid when the batch flushes.
         buf.reply_token = reply_token
-        buf.event_ts_ms = event_ts_ms
         buf.dify_user = dify_user
         buf.effective_name = effective_name
         buf.target = target

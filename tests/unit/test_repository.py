@@ -1,6 +1,7 @@
 """Repository tests against a real SQLite file (plan §7.4)."""
 
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -305,3 +306,74 @@ class TestReadOnlyConnection:
         """connect_read() is an optimization, not a precondition."""
         with db.locked_ro() as conn:
             assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+class TestReceiptTime:
+    """received_ms drives the reply-token window (LINE's clock starts when a
+    delivery reaches us), so every path that hands out a job must carry it."""
+
+    def test_claimed_job_carries_receipt_time(self, repo: Repository) -> None:
+        before = int(time.time() * 1000)
+        row_id = claim(repo)
+        after = int(time.time() * 1000)
+        assert row_id is not None
+        job = repo.get_job(row_id)
+        assert job is not None
+        assert job.received_ms is not None
+        assert before - 1 <= job.received_ms <= after + 1
+        assert job.event_ts_ms == 1_700_000_000_000, "event time is kept separately"
+
+    def test_recovered_job_keeps_original_receipt_time(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        original = repo.get_job(row_id)
+        assert original is not None
+        [recovered] = repo.recover_orphans(max_age_seconds=3600)
+        assert recovered.received_ms == original.received_ms
+
+
+class TestDeliveryFailed:
+    def status(self, repo: Repository, row_id: int) -> tuple[str, str | None]:
+        with repo._db.locked() as conn:
+            row = conn.execute(
+                "SELECT status, last_error FROM inbox WHERE id = ?", (row_id,)
+            ).fetchone()
+        return row["status"], row["last_error"]
+
+    def test_survives_the_handler_finishing(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_delivery_failed(row_id, "push_quota_exhausted")
+        repo.mark_done(row_id)  # pipeline's post-handler bookkeeping
+        assert self.status(repo, row_id) == ("delivery_failed", "push_quota_exhausted")
+
+    def test_applies_to_a_job_already_done(self, repo: Repository) -> None:
+        """A debounced media batch flushes after its job was marked done."""
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_done(row_id)
+        repo.mark_delivery_failed(row_id, "push_failed:500")
+        assert self.status(repo, row_id) == ("delivery_failed", "push_failed:500")
+
+    def test_does_not_mask_the_original_failure(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_failed(row_id, "DifyTransient('boom')")
+        repo.mark_delivery_failed(row_id, "push_quota_exhausted")
+        assert self.status(repo, row_id) == ("failed", "DifyTransient('boom')")
+
+    def test_purged_like_other_finished_rows(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_delivery_failed(row_id, "push_quota_exhausted")
+        with repo._db.locked() as conn:
+            conn.execute(
+                "UPDATE inbox SET enqueued_at = ? WHERE id = ?",
+                (utc_cutoff_iso(10 * 86400), row_id),
+            )
+        purged_inbox, _ = repo.purge_expired(dedup_retention_days=3, message_retention_days=3)
+        assert purged_inbox == 1

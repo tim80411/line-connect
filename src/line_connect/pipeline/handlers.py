@@ -21,9 +21,10 @@ from line_connect.formatting import build_reply
 from line_connect.line.client import LineClient
 from line_connect.line.events import LineEvent, LineMessage, LineSource
 from line_connect.line.messages import push_target
+from line_connect.line.reply_token import ReplyToken
 from line_connect.pipeline.debounce import MediaDebouncer
 from line_connect.pipeline.notify import Notifier
-from line_connect.pipeline.replier import Replier
+from line_connect.pipeline.replier import Replier, reply_token_of
 from line_connect.storage.repository import InboxJob, Repository
 
 if TYPE_CHECKING:
@@ -141,7 +142,7 @@ class Bridge:
         if not target:
             return
         await self._replier.send_text(
-            job.id, target, event.reply_token, event.timestamp,
+            job.id, target, reply_token_of(job),
             self._settings.welcome_message,
         )
 
@@ -161,7 +162,7 @@ class Bridge:
             # its cid key.
             await asyncio.to_thread(self._repo.clear_cid, chat_key)
             await self._replier.send_text(
-                job.id, target, event.reply_token, event.timestamp,
+                job.id, target, reply_token_of(job),
                 self._settings.clear_confirm_message,
             )
             log.info("conversation_cleared", chat_key=chat_key)
@@ -192,7 +193,7 @@ class Bridge:
 
             if not result.answer:
                 await self._replier.send_text(
-                    job.id, target, event.reply_token, event.timestamp, EMPTY_ANSWER_MESSAGE
+                    job.id, target, reply_token_of(job), EMPTY_ANSWER_MESSAGE
                 )
                 return
 
@@ -208,7 +209,7 @@ class Bridge:
                 strip_md=self._settings.strip_markdown,
             )
             await self._replier.send(
-                job.id, target, event.reply_token, event.timestamp, messages
+                job.id, target, reply_token_of(job), messages
             )
 
     # ── media ──────────────────────────────────────────────────────
@@ -223,8 +224,7 @@ class Bridge:
                 await self._replier.send_text(
                     job.id,
                     push_target(event.source),
-                    event.reply_token,
-                    event.timestamp,
+                    reply_token_of(job),
                     MEDIA_UNSUPPORTED_MESSAGE,
                 )
             return
@@ -252,7 +252,7 @@ class Bridge:
                 )
                 if self._settings.debug_mode:
                     await self._replier.send_text(
-                        job.id, target, event.reply_token, event.timestamp,
+                        job.id, target, reply_token_of(job),
                         f"[DEBUG] Download failed: {str(exc)[:300]}",
                     )
                 return
@@ -269,7 +269,7 @@ class Bridge:
             if file_info is None:
                 if self._settings.debug_mode:
                     await self._replier.send_text(
-                        job.id, target, event.reply_token, event.timestamp,
+                        job.id, target, reply_token_of(job),
                         "[DEBUG] Upload to Dify failed",
                     )
                 return
@@ -294,8 +294,7 @@ class Bridge:
                     file_obj=file_obj,
                     msg_label=message.type,
                     job_id=job.id,
-                    reply_token=event.reply_token,
-                    event_ts_ms=event.timestamp,
+                    reply_token=reply_token_of(job),
                     dify_user=who.dify_user,
                     effective_name=who.effective_name,
                     target=target,
@@ -309,8 +308,7 @@ class Bridge:
                 files=[file_obj],
                 msg_labels=[message.type],
                 job_id=job.id,
-                reply_token=event.reply_token,
-                event_ts_ms=event.timestamp,
+                reply_token=reply_token_of(job),
                 dify_user=who.dify_user,
                 effective_name=who.effective_name,
                 target=target,
@@ -330,7 +328,6 @@ class Bridge:
             msg_labels=buf.msg_labels,
             job_id=buf.last_job_id,
             reply_token=buf.reply_token,
-            event_ts_ms=buf.event_ts_ms,
             dify_user=buf.dify_user,
             effective_name=buf.effective_name,
             target=buf.target,
@@ -344,8 +341,7 @@ class Bridge:
         files: list[dict[str, Any]],
         msg_labels: list[str],
         job_id: int,
-        reply_token: str | None,
-        event_ts_ms: int | None,
+        reply_token: ReplyToken,
         dify_user: str,
         effective_name: str | None,
         target: str,
@@ -382,7 +378,7 @@ class Bridge:
             flex_enabled=self._settings.flex_message_enabled,
             strip_md=self._settings.strip_markdown,
         )
-        await self._replier.send(job_id, target, reply_token, event_ts_ms, messages)
+        await self._replier.send(job_id, target, reply_token, messages)
 
     # ── shared plumbing ────────────────────────────────────────────
 

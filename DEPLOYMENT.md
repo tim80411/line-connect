@@ -213,6 +213,7 @@ ssh oci-cp "kubectl get secret line-connect-secret -n line-connect -o jsonpath='
 | 後台一直被鎖（429） | per-IP 鎖定 5 分鐘；若 ingress 沒帶 `X-Forwarded-For`，所有人共用同一個 IP 身分 | 等 300 秒，或 `kubectl rollout restart`（rate limit 存記憶體，重啟即清） |
 | 登入成功但清單空白 | 該 chat 的 `last_message_at` 是 NULL（被 clear_all_chats 清過，或 migration 前就沒有 user 訊息） | 正常行為；下一則使用者訊息就會回到清單 |
 | 圖片破圖 | `MEDIA_STORE_ENABLED` 沒開，或該圖已被 count/size 淘汰 | 檢查 `MEDIA_STORE_MAX_COUNT` / `MEDIA_STORE_MAX_MB`；舊訊息的圖不會回溯補存 |
+| inbox 出現 `delivery_failed`、log 有 `push_quota_exhausted` | 本月 push 額度用完（LINE 回 429 "monthly limit"）。reply 免費不受影響，只有 token 已失效、必須 push 的回覆會送不出去 | 升級方案或等月初重置；app 每 `PUSH_QUOTA_COOLDOWN_SECONDS`（預設 1 小時）自動再試一次 push，不用重啟。`last_error` 記著原因 |
 
 ## 觀測
 
@@ -220,6 +221,12 @@ ssh oci-cp "kubectl get secret line-connect-secret -n line-connect -o jsonpath='
 # 結構化 log（json）；單一訊息全鏈路用 chat_key / dedup_key / job_id 串
 ssh oci-cp "kubectl logs -n line-connect -l app=line-connect --tail=100" | grep '<chat_key>'
 # 佇列深度：housekeeping 每分鐘 log 一次 queue_depth（非零才印）
+# reply 命中率（push 會扣月額度，reply 免費）；reply_skip 欄位記著沒走 reply 的原因
+ssh oci-cp "kubectl logs -n line-connect -l app=line-connect --since=24h" | grep '"event": "delivered"' | grep -o '"via": "[a-z]*"' | sort | uniq -c
+# LINE 第一次投遞沒到 app 的次數（被 claim 的是重送 = 先前的嘗試全部失敗）
+ssh oci-cp "kubectl logs -n line-connect -l app=line-connect --since=24h" | grep '"event": "event_claimed"' | grep -c '"redelivery": true'
+# webhook 處理耗時與被拒（uvicorn 關了 access log，這兩種 log 是唯一的請求紀錄）
+ssh oci-cp "kubectl logs -n line-connect -l app=line-connect --since=24h" | grep -E '"event": "webhook_(handled|rejected)"'
 # DB 狀態
 ssh oci-cp "kubectl exec -n line-connect deploy/line-connect -- python -c \"import sqlite3;c=sqlite3.connect('/data/line-connect.db');print(c.execute('select status,count(*) from inbox group by status').fetchall())\""
 ```

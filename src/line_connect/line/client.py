@@ -5,6 +5,7 @@ a fixed latency tax on every reply.
 """
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -26,6 +27,22 @@ BOT_INFO_CACHE_TTL_SECONDS = 3600.0
 Profile = tuple[str | None, str | None]
 
 
+@dataclass(frozen=True)
+class SendResult:
+    """Outcome of a reply/push call. status None = no HTTP answer at all."""
+
+    ok: bool
+    status: int | None = None
+    body: str = ""
+
+    @property
+    def quota_exhausted(self) -> bool:
+        """The account's monthly message allowance is spent. LINE says so with
+        a 429 whose message names the monthly limit; a plain rate limit is
+        also 429 but transient, so the status alone cannot tell them apart."""
+        return self.status == 429 and "monthly limit" in self.body.lower()
+
+
 class LineClient:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self._settings = settings
@@ -39,7 +56,7 @@ class LineClient:
 
     # ── messaging ──────────────────────────────────────────────────
 
-    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> bool:
+    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> SendResult:
         try:
             resp = await self._client.post(
                 f"{LINE_API_BASE}/bot/message/reply",
@@ -49,13 +66,14 @@ class LineClient:
             )
         except httpx.TransportError as exc:
             log.warning("line_reply_transport_error", error=str(exc))
-            return False
+            return SendResult(ok=False)
         if resp.status_code == 200:
-            return True
-        log.warning("line_reply_failed", status=resp.status_code, body=resp.text[:200])
-        return False
+            return SendResult(ok=True, status=200)
+        body = resp.text[:200]
+        log.warning("line_reply_failed", status=resp.status_code, body=body)
+        return SendResult(ok=False, status=resp.status_code, body=body)
 
-    async def push(self, to: str, messages: list[dict[str, Any]]) -> bool:
+    async def push(self, to: str, messages: list[dict[str, Any]]) -> SendResult:
         try:
             resp = await self._client.post(
                 f"{LINE_API_BASE}/bot/message/push",
@@ -65,11 +83,12 @@ class LineClient:
             )
         except httpx.TransportError as exc:
             log.warning("line_push_transport_error", error=str(exc))
-            return False
+            return SendResult(ok=False)
         if resp.status_code == 200:
-            return True
-        log.error("line_push_failed", status=resp.status_code, body=resp.text[:200])
-        return False
+            return SendResult(ok=True, status=200)
+        body = resp.text[:200]
+        log.error("line_push_failed", status=resp.status_code, body=body)
+        return SendResult(ok=False, status=resp.status_code, body=body)
 
     async def show_loading(self, chat_id: str, seconds: int = 60) -> None:
         """Best-effort typing indicator. Only valid for 1:1 chats — LINE

@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     queue_max_size: int = 500
     job_timeout_seconds: float = 240
     reply_token_ttl_seconds: float = 50
+    # After LINE reports the monthly message allowance spent, skip push for
+    # this long before probing again. A probe is a rejected (unbilled) call;
+    # the wait just keeps every answer from repeating it until the plan is
+    # upgraded or the month rolls over.
+    push_quota_cooldown_seconds: float = 3600
     max_recovery_age_seconds: float = 120
     # shutdown_grace + drain_delay must stay below k8s
     # terminationGracePeriodSeconds (40) and uvicorn --timeout-graceful-shutdown (35).
