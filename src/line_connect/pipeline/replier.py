@@ -37,13 +37,37 @@ class Replier:
         while len(self._consumed) > CONSUMED_TOKENS_MAX:
             self._consumed.pop(next(iter(self._consumed)))
 
-    def _token_usable(self, reply_token: str | None, event_ts_ms: int | None) -> bool:
-        if not reply_token or reply_token in self._consumed:
-            return False
+    def _reply_skip_reason(
+        self, reply_token: str | None, event_ts_ms: int | None
+    ) -> str | None:
+        """None when the token is worth a reply attempt, else why not."""
+        if not reply_token:
+            return "no_token"
+        if reply_token in self._consumed:
+            return "token_consumed"
         if event_ts_ms is None:
-            return True
+            return None
         age_ms = time.time() * 1000 - event_ts_ms
-        return age_ms < self._settings.reply_token_ttl_seconds * 1000
+        if age_ms >= self._settings.reply_token_ttl_seconds * 1000:
+            return "token_expired"
+        return None
+
+    async def _delivered(
+        self, job_id: int, via: str, skip_reason: str | None, event_ts_ms: int | None
+    ) -> bool:
+        await asyncio.to_thread(self._repo.mark_reply_sent, job_id)
+        # One line per delivered job: `via` gives the reply hit rate directly;
+        # reply_skip says why a push was needed without re-deriving it.
+        log.info(
+            "delivered",
+            job_id=job_id,
+            via=via,
+            reply_skip=skip_reason,
+            token_age_ms=(
+                int(time.time() * 1000) - event_ts_ms if event_ts_ms is not None else None
+            ),
+        )
+        return True
 
     async def send(
         self,
@@ -57,17 +81,17 @@ class Replier:
         if not messages:
             return False
 
-        if self._token_usable(reply_token, event_ts_ms):
+        skip_reason = self._reply_skip_reason(reply_token, event_ts_ms)
+        if skip_reason is None:
             assert reply_token is not None
             self._consume(reply_token)  # one shot even if it fails — LINE burns it
             if await self._line.reply(reply_token, messages):
-                await asyncio.to_thread(self._repo.mark_reply_sent, job_id)
-                return True
+                return await self._delivered(job_id, "reply", None, event_ts_ms)
             log.info("reply_failed_fallback_push", job_id=job_id)
+            skip_reason = "reply_rejected"
 
         if await self._line.push(target, messages):
-            await asyncio.to_thread(self._repo.mark_reply_sent, job_id)
-            return True
+            return await self._delivered(job_id, "push", skip_reason, event_ts_ms)
 
         # Last resort (risk R5): LINE validates the whole batch — one bad image
         # URL fails everything. Retry once with text content only.
@@ -75,10 +99,9 @@ class Replier:
         if text_only and len(text_only) < len(messages):
             log.warning("push_failed_retry_text_only", job_id=job_id)
             if await self._line.push(target, text_only):
-                await asyncio.to_thread(self._repo.mark_reply_sent, job_id)
-                return True
+                return await self._delivered(job_id, "push", skip_reason, event_ts_ms)
 
-        log.error("delivery_failed", job_id=job_id, target=target[:12])
+        log.error("delivery_failed", job_id=job_id, target=target[:12], reply_skip=skip_reason)
         return False
 
     async def send_text(
