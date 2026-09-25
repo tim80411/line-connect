@@ -8,7 +8,9 @@ Two improvements over upstream's reply-then-push:
 (b) used/burned tokens are remembered so a debounced batch never reuses one.
 
 Reply stays preferred because LINE bills Push messages against the plan quota;
-Reply is free.
+Reply is free. Once LINE reports that quota spent, push is skipped for a
+cooldown (every attempt would be refused), and an answer that reaches the
+user by neither path is recorded on its job as 'delivery_failed'.
 """
 
 import asyncio
@@ -18,7 +20,7 @@ from typing import Any
 import structlog
 
 from line_connect.config import Settings
-from line_connect.line.client import LineClient
+from line_connect.line.client import LineClient, SendResult
 from line_connect.line.messages import LINE_MAX_MESSAGES, text_msg
 from line_connect.line.reply_token import ReplyToken
 from line_connect.storage.repository import InboxJob, Repository
@@ -44,6 +46,7 @@ class Replier:
         self._line = line
         self._repo = repo
         self._consumed: dict[str, None] = {}  # insertion-ordered set
+        self._push_blocked_until = 0.0  # monotonic; quota-exhausted breaker
 
     def _consume(self, token: str) -> None:
         self._consumed[token] = None
@@ -57,6 +60,14 @@ class Replier:
         return token.skip_reason(
             _now_ms(), int(self._settings.reply_token_ttl_seconds * 1000)
         )
+
+    def _push_blocked(self) -> bool:
+        return time.monotonic() < self._push_blocked_until
+
+    def _block_push(self) -> None:
+        cooldown = self._settings.push_quota_cooldown_seconds
+        self._push_blocked_until = time.monotonic() + cooldown
+        log.error("push_quota_exhausted", cooldown_seconds=cooldown)
 
     async def _delivered(
         self, job_id: int, via: str, skip_reason: str | None, token: ReplyToken
@@ -88,24 +99,48 @@ class Replier:
         if skip_reason is None:
             assert token.value is not None
             self._consume(token.value)  # one shot even if it fails — LINE burns it
-            if await self._line.reply(token.value, messages):
+            if (await self._line.reply(token.value, messages)).ok:
                 return await self._delivered(job_id, "reply", None, token)
             log.info("reply_failed_fallback_push", job_id=job_id)
             skip_reason = "reply_rejected"
 
-        if await self._line.push(target, messages):
-            return await self._delivered(job_id, "push", skip_reason, token)
+        if self._push_blocked():
+            reason = "push_quota_exhausted"  # LINE would refuse again; don't ask
+        else:
+            result = await self._push(job_id, target, messages)
+            if result.ok:
+                return await self._delivered(job_id, "push", skip_reason, token)
+            reason = (
+                "push_quota_exhausted"
+                if result.quota_exhausted
+                else f"push_failed:{result.status or 'transport'}"
+            )
+        log.error(
+            "delivery_failed",
+            job_id=job_id,
+            target=target[:12],
+            reply_skip=skip_reason,
+            reason=reason,
+        )
+        await asyncio.to_thread(self._repo.mark_delivery_failed, job_id, reason)
+        return False
+
+    async def _push(
+        self, job_id: int, target: str, messages: list[dict[str, Any]]
+    ) -> SendResult:
+        result = await self._line.push(target, messages)
 
         # Last resort (risk R5): LINE validates the whole batch — one bad image
-        # URL fails everything. Retry once with text content only.
+        # URL fails everything. Retry once with text content only. Not on a
+        # 429: a quota or rate refusal would refuse the smaller batch too.
         text_only = [m for m in messages if m.get("type") == "text"]
-        if text_only and len(text_only) < len(messages):
+        if not result.ok and result.status != 429 and 0 < len(text_only) < len(messages):
             log.warning("push_failed_retry_text_only", job_id=job_id)
-            if await self._line.push(target, text_only):
-                return await self._delivered(job_id, "push", skip_reason, token)
+            result = await self._line.push(target, text_only)
 
-        log.error("delivery_failed", job_id=job_id, target=target[:12], reply_skip=skip_reason)
-        return False
+        if result.quota_exhausted:
+            self._block_push()
+        return result
 
     async def send_text(
         self,

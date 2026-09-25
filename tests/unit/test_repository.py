@@ -330,3 +330,50 @@ class TestReceiptTime:
         assert original is not None
         [recovered] = repo.recover_orphans(max_age_seconds=3600)
         assert recovered.received_ms == original.received_ms
+
+
+class TestDeliveryFailed:
+    def status(self, repo: Repository, row_id: int) -> tuple[str, str | None]:
+        with repo._db.locked() as conn:
+            row = conn.execute(
+                "SELECT status, last_error FROM inbox WHERE id = ?", (row_id,)
+            ).fetchone()
+        return row["status"], row["last_error"]
+
+    def test_survives_the_handler_finishing(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_delivery_failed(row_id, "push_quota_exhausted")
+        repo.mark_done(row_id)  # pipeline's post-handler bookkeeping
+        assert self.status(repo, row_id) == ("delivery_failed", "push_quota_exhausted")
+
+    def test_applies_to_a_job_already_done(self, repo: Repository) -> None:
+        """A debounced media batch flushes after its job was marked done."""
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_done(row_id)
+        repo.mark_delivery_failed(row_id, "push_failed:500")
+        assert self.status(repo, row_id) == ("delivery_failed", "push_failed:500")
+
+    def test_does_not_mask_the_original_failure(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_failed(row_id, "DifyTransient('boom')")
+        repo.mark_delivery_failed(row_id, "push_quota_exhausted")
+        assert self.status(repo, row_id) == ("failed", "DifyTransient('boom')")
+
+    def test_purged_like_other_finished_rows(self, repo: Repository) -> None:
+        row_id = claim(repo)
+        assert row_id is not None
+        repo.mark_processing(row_id)
+        repo.mark_delivery_failed(row_id, "push_quota_exhausted")
+        with repo._db.locked() as conn:
+            conn.execute(
+                "UPDATE inbox SET enqueued_at = ? WHERE id = ?",
+                (utc_cutoff_iso(10 * 86400), row_id),
+            )
+        purged_inbox, _ = repo.purge_expired(dedup_retention_days=3, message_retention_days=3)
+        assert purged_inbox == 1
