@@ -145,8 +145,7 @@ make check              # ruff + mypy(strict) + pytest
 
 ## 部署
 
-正規流程是推 `vX.Y.Z` tag 讓 CI 建置並更新 manifests（見
-[DEPLOYMENT.md](DEPLOYMENT.md)）。手動建置只用於本機驗證：
+推 `vX.Y.Z` tag 只會讓 CI 建置並推 image 到 ghcr，**不再更新任何 manifests、不再部署**（OCI/k8s 部署已於 2026-10-05 下線，見 [DEPLOYMENT.md](DEPLOYMENT.md) 開頭橫幅）。手動建置只用於本機驗證：
 
 ```bash
 docker build -t ghcr.io/tim80411/line-connect:<X.Y.Z> .
