@@ -152,8 +152,8 @@ make check              # ruff + mypy(strict) + pytest
 docker build -t ghcr.io/tim80411/line-connect:<X.Y.Z> .
 ```
 
-k8s manifests 在 [k8s-apps](https://github.com/tim80411/k8s-apps) repo 的
-`apps/line-connect/`（ArgoCD app-of-apps 自動部署）。**硬性約束**（in-memory
+OCI/k8s 部署已於 2026-10-05 下線（k8s-apps #289）；Cloudflare Workers 版在分支
+`cloudflare-workers` 的 `cf/` 目錄，尚未上線。以下為舊 k8s 版的**硬性約束**（in-memory
 queue + SQLite 單寫入者）：
 
 - `replicas: 1` + `strategy: Recreate`（不可 RollingUpdate）

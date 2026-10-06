@@ -1,5 +1,9 @@
 # DEPLOYMENT.md — 部署操作手冊（供 LLM agent 使用）
 
+> **⚠️ 2026-10-05 已下線。** 本文件描述的 OCI/k8s 部署已完整移除（k8s-apps PR #289），
+> `deploy` job 也已從 `.github/workflows/docker.yml` 拆掉；推 `v*` tag 現在只會建 image、不會部署。
+> 以下內容保留為歷史 runbook。接替方案是 Cloudflare Workers 版（分支 `cloudflare-workers`，`cf/`）。
+
 > 本文件的讀者是操作部署的 LLM agent 或工程師。所有命令可直接執行；
 > 每個操作段落都附驗證命令——**執行後必須驗證，不可只看命令有沒有報錯**。
 
