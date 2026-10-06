@@ -145,15 +145,14 @@ make check              # ruff + mypy(strict) + pytest
 
 ## 部署
 
-正規流程是推 `vX.Y.Z` tag 讓 CI 建置並更新 manifests（見
-[DEPLOYMENT.md](DEPLOYMENT.md)）。手動建置只用於本機驗證：
+推 `vX.Y.Z` tag 只會讓 CI 建置並推 image 到 ghcr，**不再更新任何 manifests、不再部署**（OCI/k8s 部署已於 2026-10-05 下線，見 [DEPLOYMENT.md](DEPLOYMENT.md) 開頭橫幅）。手動建置只用於本機驗證：
 
 ```bash
 docker build -t ghcr.io/tim80411/line-connect:<X.Y.Z> .
 ```
 
-k8s manifests 在 [k8s-apps](https://github.com/tim80411/k8s-apps) repo 的
-`apps/line-connect/`（ArgoCD app-of-apps 自動部署）。**硬性約束**（in-memory
+OCI/k8s 部署已於 2026-10-05 下線（k8s-apps #289）；Cloudflare Workers 版在分支
+`cloudflare-workers` 的 `cf/` 目錄，尚未上線。以下為舊 k8s 版的**硬性約束**（in-memory
 queue + SQLite 單寫入者）：
 
 - `replicas: 1` + `strategy: Recreate`（不可 RollingUpdate）
